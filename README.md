@@ -1,4 +1,4 @@
-# DUKE_MIDS_QFC_Final_Project
+# DUKE QFC FINAL PROJECT: Predicting Deposit Levels and Stress Testing
 DUKE MIDS QFC: Predicting Deposit Levels and Stress Testing
 
 ## Project Goal
