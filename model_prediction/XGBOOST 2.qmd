@@ -1,0 +1,664 @@
+---
+title: "XGBOOST"
+format: html
+editor: visual
+---
+
+## 1. Loading Required Libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(xgboost)
+library(caret)
+library(MLmetrics)
+library(pROC)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(lubridate)
+library(car)
+library(haven)
+library(glmnet)
+library(tidyverse)
+library(haven)
+library(quantmod)
+library(timetk)
+```
+
+## 2. Loading the FDIC Data in
+
+```{r}
+# Load data
+data <- read_dta("~/Desktop/Fin Project/data2.dta")
+# Add year, quarter, and date columns
+data <- data %>%
+mutate(
+year = as.numeric(substr(time, 1, 4)),
+quarter = as.numeric(substr(time, 6, 6)),
+date = case_when(
+quarter == 1 ~ as.Date(paste0(year, "-01-01")),
+quarter == 2 ~ as.Date(paste0(year, "-04-01")),
+quarter == 3 ~ as.Date(paste0(year, "-07-01")),
+quarter == 4 ~ as.Date(paste0(year, "-10-01"))
+)
+)
+```
+
+### Adding Other Economic Indicators from FRED
+
+```{r}
+# Get U.S. GDP and population data
+getSymbols("GDP", src = "FRED") # Quarterly GDP (in billions)
+getSymbols("POP", src = "FRED") # Total U.S. population
+# Interest rates
+getSymbols("FEDFUNDS", src = "FRED")  # Federal Funds Rate, overnight interest rate set by the Fed
+getSymbols("MPRIME", src = "FRED") # Prime Loan Rate
+getSymbols("GS10", src = "FRED") # 10-Year Treasury Rate
+# Inflation and prices
+getSymbols("CPIAUCSL", src = "FRED")# Consumer Price Index
+getSymbols("PCEPI", src = "FRED") # Personal Consumption Expenditures Price Index
+getSymbols("PPIACO", src = "FRED") # Producer Price Index
+# Economic growth
+getSymbols("INDPRO", src = "FRED") # Industrial Production Index
+getSymbols("RSAFS", src = "FRED") # Retail Sales
+getSymbols("TTLCONS", src = "FRED") #Total Construction Spending
+# Labor market
+getSymbols("UNRATE", src = "FRED")   # Unemployment Rate
+getSymbols("EMRATIO", src = "FRED")   # Employment-Population Ratio
+getSymbols("PAYEMS", src = "FRED") # Nonfarm Payrolls
+getSymbols("CIVPART", src = "FRED")  # Labor Force Participation Rate
+# Money supply and banking
+getSymbols("M2SL", src = "FRED")         # total money supply in circulation, including savings and time deposits
+getSymbols("TOTRESNS", src = "FRED")     # Total Reserves held by banks
+getSymbols("BUSLOANS", src = "FRED")     # Commercial and Industrial Loans
+getSymbols("REALLN", src = "FRED")       # Consumer Loans
+# Sentiment
+getSymbols("UMCSENT", src = "FRED")      # Consumer Sentiment Index
+# Financial markets
+getSymbols("SP500", src = "FRED")        # S&P 500 Index
+getSymbols("DJIA", src = "FRED")         # Dow Jones Industrial Average
+getSymbols("VIXCLS", src = "FRED")       # Volatility Index
+# Housing market
+getSymbols("HOUST", src = "FRED")        # Housing construction Starts
+getSymbols("CSUSHPINSA", src = "FRED")   # Case-Shiller Home Price Index. tracks change in home prices over time
+getSymbols("EXHOSLUSM495S", src = "FRED") # Existing Home Sales
+
+# Compute GDP per capita
+GDP_per_capita <- GDP / POP
+GDP_per_capita <- na.omit(GDP_per_capita)
+```
+
+### Merging with main DF
+
+```{r}
+# List of FRED variables to merge
+fred_variables <- c(
+  "FEDFUNDS", "MPRIME", "GS10",
+  "CPIAUCSL", "PCEPI", "PPIACO", "INDPRO", "RSAFS", "TTLCONS",
+  "UNRATE", "EMRATIO", "PAYEMS", "CIVPART", "M2SL", "TOTRESNS",
+  "BUSLOANS", "REALLN", "UMCSENT", "SP500", "DJIA", "VIXCLS",
+  "HOUST", "CSUSHPINSA", "EXHOSLUSM495S"
+)
+
+# Loop over each FRED variable
+for (var in fred_variables) {
+  xts_data <- get(var)
+  df_data <- data.frame(date = index(xts_data), value = coredata(xts_data)) %>% as_tibble()
+  
+  df_data$date <- as.Date(df_data$date)
+  colnames(df_data)[2] <- var
+  
+  # Merge into 'data' dataframe
+  data <- data %>%
+    left_join(df_data, by = "date")
+}
+
+#For GDP per capita
+# Convert xts object to data frame
+GDP_per_capita_df <- data.frame(date = index(GDP_per_capita), GDP_per_capita = coredata(GDP_per_capita)) %>% as_tibble()
+# Merge GDP per capita into the dataset
+data <- data %>%
+left_join(GDP_per_capita_df, by = "date")
+```
+
+### Cleaning Data
+
+```{r}
+# Remove columns with excessive missing values
+na_counts <- colSums(is.na(data))
+columns_to_remove <- names(na_counts[na_counts > 20])
+data <- data %>% select(-all_of(columns_to_remove))
+# Handle remaining missing values
+data_nonNA <- na.omit(data)
+# Remove non-numerical columns
+data_nonNA <- data_nonNA %>% select(-time, -date)
+if (class(data_nonNA$deposits) == "list") {
+data_nonNA$deposits <- as.numeric(unlist(data_nonNA$deposits))
+}
+```
+
+## 3. Feature Engineering
+
+### Feature Selection - Lasso Regression
+
+```{r}
+# Load necessary libraries
+library(glmnet)
+library(dplyr)
+library(tidyr)
+
+# Define the list of predictors after dropping NAs
+predictors <- c(
+  "FEDFUNDS", "MPRIME", "GS10",
+  "CPIAUCSL", "PCEPI", "PPIACO", "INDPRO",
+  "UNRATE", "EMRATIO", "PAYEMS", "CIVPART", "M2SL", "TOTRESNS",
+  "BUSLOANS", "REALLN", "UMCSENT",
+  "HOUST", "CSUSHPINSA", "GDP"
+)
+
+# Prepare the predictor matrix and response vector
+X <- data %>% select(all_of(predictors))
+y <- data$deposits
+# Convert to matrices
+X_matrix <- as.matrix(X)
+y_vector <- as.numeric(y)
+# Handle missing values
+complete_cases <- complete.cases(X_matrix, y_vector)
+X_matrix <- X_matrix[complete_cases, ]
+y_vector <- y_vector[complete_cases]
+
+# Get the number of observations
+n_obs <- nrow(X_matrix)
+# Define the number of folds
+n_folds <- 5
+
+# Create fold IDs that increase over time
+fold_size <- floor(n_obs / n_folds)
+foldid <- rep(1:n_folds, each = fold_size)
+# Adjust for any remaining observations
+if (length(foldid) < n_obs) {
+  foldid <- c(foldid, rep(n_folds, n_obs - length(foldid)))
+}
+# Verify foldid length
+if (length(foldid) != n_obs) {
+  stop("Fold ID length does not match the number of observations.")
+}
+# Set seed for reproducibility
+set.seed(123)
+
+# Perform cross-validation with custom fold IDs
+cv_lasso <- cv.glmnet(
+  x = X_matrix,
+  y = y_vector,
+  alpha = 1,
+  nfolds = n_folds,
+  foldid = foldid,
+  standardize = TRUE,
+  type.measure = "mse"
+)
+
+# Optimal lambda
+lambda_min <- cv_lasso$lambda.min #this retrieves lambda
+lambda_1se <- cv_lasso$lambda.1se #Retrieves the largest value of lambda such that the cross-validated error is within one standard error of the minimum MSE
+cat("Lambda minimizing MSE (lambda.min):", lambda_min, "\n")
+cat("Lambda within 1 SE of min MSE (lambda.1se):", lambda_1se, "\n")
+
+# Extract coefficients at lambda.min
+coef_min <- coef(cv_lasso, s = "lambda.min")
+
+# Convert coefficients to data frame
+coef_df <- as.data.frame(as.matrix(coef_min))
+coef_df <- coef_df %>% mutate(predictor = rownames(coef_df))
+colnames(coef_df)[1] <- "coefficient"
+
+# Exclude the intercept
+coef_df <- coef_df %>% filter(predictor != "(Intercept)")
+
+# Identify non-zero coefficients
+selected_predictors <- coef_df %>% filter(coefficient >1)
+
+# Print selected predictors
+cat("Predictors selected by Lasso regression at lambda.min:\n")
+print(selected_predictors)
+```
+
+Predictors
+```{r}
+predictors9 <- c(
+  "MPRIME", "PPIACO", "INDPRO", "EMRATIO", "BUSLOANS", "REALLN", "UMCSENT", "HOUST", "CSUSHPINSA"
+)
+
+# predictors6 <- c(
+#   "MPRIME", "PPIACO", "INDPRO", "EMRATIO", "BUSLOANS", "REALLN"
+# )
+# 
+# predictors3 <- c(
+#   "MPRIME", "PPIACO", "INDPRO"
+# )
+```
+
+### Lags
+
+### Create lags for deposits
+```{r}
+# Create lagged features for the 'deposits' column with only 3 lags
+lagged_data <- tk_augment_lags(data_nonNA, .value = deposits, .lags = 1:5)
+
+# Remove rows with NAs (due to lags)
+lagged_data <- na.omit(lagged_data)
+
+# Define lagged columns for 3 lags
+lagged_cols <- paste0("deposits_lag", 1:5)
+
+# Convert lagged columns to numeric if necessary
+for (col in lagged_cols) {
+  if (class(lagged_data[[col]]) == "list") {
+    lagged_data[[col]] <- as.numeric(unlist(lagged_data[[col]]))
+  } else {
+    lagged_data[[col]] <- as.numeric(lagged_data[[col]])
+  }
+}
+
+```
+
+### Creating lags for predictors (X)
+```{r}
+# Define the predictors you want to lag
+predictors_to_lag <- predictors9
+
+# Convert predictors to numeric if necessary
+for (col in predictors_to_lag) {
+  lagged_data[[col]] <- as.numeric(lagged_data[[col]])
+}
+lags <- 1:5
+lagged_data <- lagged_data %>%
+  tk_augment_lags(.value = predictors_to_lag, .lags = lags)
+
+# Create a vector of lagged predictor column names
+lagged_predictor_cols <- expand.grid(predictors_to_lag, lags) %>%
+  mutate(lagged_col = paste0(Var1, "_lag", Var2)) %>%
+  pull(lagged_col)
+
+# Convert lagged predictor columns to numeric
+for (col in lagged_predictor_cols) {
+  lagged_data[[col]] <- as.numeric(lagged_data[[col]])
+}
+# Remove rows with NAs (due to lagging)
+lagged_data <- na.omit(lagged_data)
+```
+
+## 4. Train Test Split
+
+```{r}
+predictor_cols <- c(lagged_cols, predictors9)  # Adjust for your predictors
+
+# Assuming your data is ordered by time
+split_index <- floor(0.8 * nrow(lagged_data))
+train_data <- lagged_data[1:split_index, ]
+test_data <- lagged_data[(split_index + 1):nrow(lagged_data), ]
+
+# Training set
+x_train <- train_data[, predictor_cols]
+y_train <- train_data$deposits
+
+# Test set
+x_test <- test_data[, predictor_cols]
+y_test <- test_data$deposits
+
+# Prepare DMatrix for training and validation
+dtrain <- xgb.DMatrix(data = as.matrix(x_train_scaled), label = y_train)
+dtest <- xgb.DMatrix(data = as.matrix(x_test_scaled), label = y_test)
+
+#####
+# Define predictor columns and target variable
+#predictor_cols <- c(lagged_cols, predictors9)  # Adjust for your predictors
+#x_data <- lagged_data[, predictor_cols]
+#y_data <- lagged_data$deposits
+```
+
+## 5. Normalising and Scaling (X)
+
+```{r}
+# Convert predictors and target to matrices and numeric vectors
+# Scale predictors
+#x_train_scaled <- scale(x_train)
+x_train_scaled <- (x_train)
+# Apply the same transformation to test data
+#x_test_scaled <- scale(x_test, center = attr(x_train_scaled, "scaled:center"), scale = attr(x_train_scaled, "scaled:scale"))
+x_test_scaled <- x_test
+# Convert to data frames
+x_train_scaled <- as.data.frame(x_train_scaled)
+x_test_scaled <- as.data.frame(x_test_scaled)
+```
+
+## 6. XGBOOST
+
+-   Time series cross validation is used to split the data into multiple training and test sets
+-   Cross validation
+-   Evaluates models across all splits
+-   Hyperparameter tuning grid
+
+### Hyperparameter Tuning
+```{r, message = FALSE, warning = FALSE, include = FALSE}
+# Define time series cross-validation strategy
+time_control <- trainControl(
+  method = "timeslice",
+  initialWindow = 80,        # Initial training window (e.g., 80 time steps)
+  horizon = 8,           # Testing window size (e.g., next 20 time steps)
+  fixedWindow = FALSE,        # Sliding window
+  savePredictions = "final", # Save final predictions for analysis
+  verboseIter = FALSE       # Print messages or not
+)
+
+# Train the XGBoost model with caret
+xgb_grid <- expand.grid(
+  nrounds = c(100,200,300),           # Number of boosting rounds
+  max_depth = c(3,5,7,10),           # Tree depth
+  eta = c(0.01,0.05,0.3),               # Learning rate
+  gamma = c(0.1, 1, 5),              # Regularization parameter
+  colsample_bytree = c(0.8, 1),  # Column sampling. The fraction of features that are randomly sampled for each tree. Reducing this value can help prevent overfitting. 1 - uses all features for each tree.
+  min_child_weight = 1,    # Minimum child weight. specifies the min sum of the weights of all observations required in a leaf node. Higher value makes the model more conservative by requiring more observations to form a leaf. (can prevent overfitting). 1 means theres no restriction on the sum of weights for forming a leaf node. 
+  subsample = c(0.8, 1)          # Row sampling. The fraction of the training data that is randomly sampled to grow each tree (0-1). 1 uses all training data for each tree (no sampling)
+)
+
+# xgb_model_1 <- train(
+#   x = x_data_matrix,
+#   y = y_data_vector,
+#   method = "xgbTree",       # XGBoost method in caret
+#   trControl = time_control, # Time series cross-validation
+#   tuneGrid = xgb_grid       # Hyperparameter grid
+# )
+
+xgb_model_1 <- train(
+  x = as.matrix(x_train_scaled),
+  y = y_train,
+  method = "xgbTree",
+  trControl = time_control,
+  tuneGrid = xgb_grid
+)
+```
+
+### Best Tune
+```{r}
+best_tune <- xgb_model_1$bestTune
+best_tune
+```
+
+### Train best tune with xgb
+```{r, include = FALSE}
+# Define watchlist to monitor training and validation errors
+watchlist <- list(train = dtrain, eval = dtest)
+params <- list(
+  objective = "reg:squarederror",
+  max_depth = best_tune$max_depth,
+  eta = best_tune$eta,
+  gamma = best_tune$gamma,
+  colsample_bytree = best_tune$colsample_bytree,
+  min_child_weight = best_tune$min_child_weight,
+  subsample = best_tune$subsample
+)
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = best_tune$nrounds,
+  watchlist = watchlist,
+  eval_metric = "rmse",
+  verbose = 1
+)
+```
+
+## 7. Evaluation
+
+### Train - Validation Metrics - RMSE, R2, MAE, MASE
+```{r}
+# Extract evaluation log
+eval_log <- xgb_model$evaluation_log
+
+# Compute additional metrics (MAE, MASE, R²)
+eval_log <- eval_log %>%
+  mutate(
+    train_mae = abs(train_rmse), # Placeholder: Replace with true train_mae if available
+    eval_mae = abs(eval_rmse),   # Placeholder: Replace with true eval_mae if available
+    train_r2 = 1 - (train_rmse^2 / var(y_train)), # R² approximation
+    eval_r2 = 1 - (eval_rmse^2 / var(y_test)),    # R² approximation
+    train_mase = train_mae / mean(abs(diff(y_train))),
+    eval_mase = eval_mae / mean(abs(diff(y_test)))
+  )
+
+# Plot training and validation RMSE over iterations
+ggplot(eval_log, aes(x = iter)) +
+  geom_line(aes(y = train_rmse, color = "Training RMSE")) +
+  geom_line(aes(y = eval_rmse, color = "Validation RMSE")) +
+  labs(
+    title = "Training and Validation RMSE over Iterations",
+    x = "Iteration",
+    y = "RMSE"
+  ) +
+  scale_color_manual(
+    "",
+    breaks = c("Training RMSE", "Validation RMSE"),
+    values = c("blue", "red")
+  ) +
+  theme_minimal()
+
+# Plot MAE
+ggplot(eval_log, aes(x = iter)) +
+  geom_line(aes(y = train_mae, color = "Training MAE")) +
+  geom_line(aes(y = eval_mae, color = "Validation MAE")) +
+  labs(
+    title = "Training and Validation MAE over Iterations",
+    x = "Iteration",
+    y = "MAE"
+  ) +
+  scale_color_manual("", breaks = c("Training MAE", "Validation MAE"), values = c("blue", "red")) +
+  theme_minimal()
+
+# Plot R²
+ggplot(eval_log, aes(x = iter)) +
+  geom_line(aes(y = train_r2, color = "Training R²")) +
+  geom_line(aes(y = eval_r2, color = "Validation R²")) +
+  labs(
+    title = "Training and Validation R² over Iterations",
+    x = "Iteration",
+    y = "R²"
+  ) +
+  scale_color_manual("", breaks = c("Training R²", "Validation R²"), values = c("blue", "red")) +
+  theme_minimal()
+
+# Plot MASE
+ggplot(eval_log, aes(x = iter)) +
+  geom_line(aes(y = train_mase, color = "Training MASE")) +
+  geom_line(aes(y = eval_mase, color = "Validation MASE")) +
+  labs(
+    title = "Training and Validation MASE over Iterations",
+    x = "Iteration",
+    y = "MASE"
+  ) +
+  scale_color_manual("", breaks = c("Training MASE", "Validation MASE"), values = c("blue", "red")) +
+  theme_minimal()
+```
+
+### Test - Evaluation Metrics (xgb_model_1)
+```{r}
+# Make predictions on the test set
+predictions_test <- predict(xgb_model_1, newdata = as.matrix(x_test_scaled))
+
+# Calculate evaluation metrics
+test_rmse <- RMSE(predictions_test, y_test)
+test_mae <- MAE(predictions_test, y_test)
+test_r2 <- R2(predictions_test, y_test)
+
+cat("Test RMSE:", test_rmse, "\n")
+cat("Test MAE:", test_mae, "\n")
+cat("Test R²:", test_r2, "\n")
+
+# Calculate naive forecasts (lag 1)
+naive_forecasts <- c(NA, y_test[-length(y_test)])
+
+# Remove NA values for alignment
+actual_values <- y_test[-1]
+predicted_values <- predictions_test[-1]
+naive_values <- naive_forecasts[-1]
+
+# Calculate MAE for the model and naive forecast
+mae_model <- mean(abs(actual_values - predicted_values))
+mae_naive <- mean(abs(actual_values - naive_values))
+
+# Compute MASE
+test_mase <- mae_model / mae_naive
+print(paste("Test Mean Absolute Scaled Error (MASE):", round(test_mase, 4)))
+```
+
+### Test - Evaluation Metrics (xgb_model)
+```{r}
+# Make predictions on the test set using xgb_model
+predictions_test <- predict(xgb_model, newdata = dtest)
+
+# Calculate evaluation metrics
+test_rmse <- sqrt(mean((predictions_test - y_test)^2)) # RMSE
+test_mae <- mean(abs(predictions_test - y_test))       # MAE
+test_r2 <- 1 - (sum((y_test - predictions_test)^2) / sum((y_test - mean(y_test))^2)) # R²
+
+# Print evaluation metrics
+cat("Test RMSE:", round(test_rmse, 4), "\n")
+cat("Test MAE:", round(test_mae, 4), "\n")
+cat("Test R²:", round(test_r2, 4), "\n")
+
+# Calculate naive forecasts (lag 1)
+#naive_forecasts <- c(NA, y_test[-length(y_test)]) # Shift y_test by one timestep
+
+# Remove NA values for alignment
+#actual_values <- y_test[-1]
+#predicted_values <- predictions_test[-1]
+#naive_values <- naive_forecasts[-1]
+
+# Calculate MAE for the model and naive forecast
+#mae_model <- mean(abs(actual_values - predicted_values))
+#mae_naive <- mean(abs(actual_values - naive_values))
+
+# Compute MASE
+#test_mase <- mae_model / mae_naive
+#cat("Test Mean Absolute Scaled Error (MASE):", round(test_mase, 4), "\n")
+
+mase <- function(y_train, y_test, y_preds) {
+  n <- length(y_train)
+  m <- length(y_test)
+  # Calculate the denominator (scaled error from y_train)
+  denom <- 0
+  for (i in 1:(n - m)) {
+    # Compute the mean absolute difference for the m-length window
+    denom <- denom + mean(abs(y_train[(i + 1):(i + m)] - rep(y_train[i], m)))
+  }
+  denom <- denom / (n - m)
+  # Calculate the numerator (mean absolute error for predictions)
+  num <- mean(abs(y_test - y_preds))
+  # Return the MASE
+  return(num / denom)
+}
+# Calculate MASE
+mase_value <- mase(y_train, y_test, predicted_values)
+
+# Print the result
+cat("Mean Absolute Scaled Error (MASE):", round(mase_value, 4), "\n")
+
+```
+## 8. Visualisation
+
+### Actual vs Predicted Deposits
+### Validation Set
+```{r}
+# Predict on training data
+train_predictions <- predict(xgb_model, newdata = dtrain)
+
+# Create a data frame for training visualization
+results_train <- data.frame(
+  Index = 1:length(y_train),
+  Actual = y_train,
+  Predicted = train_predictions
+)
+
+# Plot actual vs predicted for training data
+ggplot(results_train, aes(x = Index)) +
+  geom_line(aes(y = Actual, color = "Actual"), size = 1) +
+  geom_line(aes(y = Predicted, color = "Predicted"), linetype = "dashed", size = 1) +
+  labs(
+    title = "Actual vs Predicted Deposits (Training Data)",
+    x = "Index",
+    y = "Deposits"
+  ) +
+  scale_color_manual(
+    name = "",
+    breaks = c("Actual", "Predicted"),
+    values = c("blue", "red")
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+
+```
+### Test Set
+```{r}
+# Predict on test data
+test_predictions <- predict(xgb_model, newdata = dtest)
+
+# Create a data frame for test visualization
+results_test <- data.frame(
+  Index = 1:length(y_test),
+  Actual = y_test,
+  Predicted = test_predictions
+)
+
+# Plot actual vs predicted for test data
+ggplot(results_test, aes(x = Index)) +
+  geom_line(aes(y = Actual, color = "Actual"), size = 1) +
+  geom_line(aes(y = Predicted, color = "Predicted"), linetype = "dashed", size = 1) +
+  labs(
+    title = "Actual vs Predicted Deposits (Test Data)",
+    x = "Index",
+    y = "Deposits"
+  ) +
+  scale_color_manual(
+    name = "",
+    breaks = c("Actual", "Predicted"),
+    values = c("blue", "red")
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+
+```
+
+## 9. Feature Importance
+
+### Feature plot for XGB
+```{r}
+# Get feature importance
+importance_matrix <- xgb.importance(model = xgb_model)
+
+# Print feature importance
+print(importance_matrix)
+
+# Plot feature importance
+xgb.plot.importance(importance_matrix, measure = "Gain") +
+  labs(
+    title = "Top 10 Features by Importance (Gain)"
+  ) +
+  theme_minimal()
+
+```
+
+### Feature plot for xgb1 (X)
+```{r}
+var_imp <- varImp(xgb_model_1)
+print(var_imp)
+plot(var_imp)
+```
